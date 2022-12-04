@@ -1,0 +1,20 @@
+module utils
+  implicit none
+
+  public
+  
+contains
+  function replace(string, c1, c2) result(modifiedString)
+    implicit none
+    character(len=*), intent(in) :: string, c1, c2
+    character(len=:), allocatable :: modifiedString
+    integer :: k
+    
+    modifiedString=string
+    do while(INDEX(modifiedString,c1).ne.0)
+       k = INDEX(modifiedString,c1)
+       modifiedString = modifiedString(:k-1)//c2//modifiedString(k+1:)
+    enddo
+  end function replace
+
+end module utils
