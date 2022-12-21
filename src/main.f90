@@ -8,19 +8,21 @@ Program Main
   
   implicit none
   real(kind=wp), allocatable :: table(:,:), remap_table(:,:), plantlist(:,:)
-  character(len=:), allocatable :: columns(:), filename, remap_columns(:), pl_columns(:)
+  character(len=:), allocatable :: columns(:), filename, remap_columns(:), pl_columns(:), out_filename
   character(len=1024) value
-  integer :: ra, dec, id, jd, rra, rdec, i, j, k, expnum, mag, length, status
-  integer :: pl_id, pl_rate, pl_angle, pl_mag, rate_limit
+  integer :: ra, dec, id, jd, rra, rdec, i, j, k, expnum, mag, length, status, likelihood
+  integer :: pl_id, pl_rate, pl_angle, pl_mag, rate_limit, obj_num, obj_num_pp, unit
+  integer :: expnum0, expnum1, nexp, kbo_id
   real(kind=wp) :: rlow, rhigh, med_ra, med_dec
   integer, allocatable :: object(:), plant(:), ids(:), links(:), link_length(:), idx(:)
-  integer, allocatable :: primary(:), secondary(:), trial(:), expnums(:)
-  real(kind=wp), allocatable :: rates(:), seps(:), rlink_length(:)
+  integer, allocatable :: primary(:), secondary(:), trial(:), expnums(:), kboids(:)
+  real(kind=wp), allocatable :: rates(:), seps(:), rlink_length(:), rand_expnums(:)
   real(kind=wp) r, angle, ra0, dec0, jd0, variance, plant_res(3)
-  logical, allocatable :: cond(:)
+  logical, allocatable :: cond(:), cond0(:), cond1(:)
   real(kind=wp), parameter :: &
        Pi = 3.141592653589793238d0, &! Pi
-       drad = Pi/180.0d0             ! Degree to radian convertion: Pi/180
+       drad = Pi/180.0d0,           &! Degree to radian convertion: Pi/180
+       match = drad*3.0d0/3600.0d0   ! this is a matched source
 
   ! get the name of the file to work on from the commandline
   CALL GET_COMMAND_ARGUMENT(1, value, length, status)
@@ -30,13 +32,37 @@ Program Main
   end if
   filename = value(1:length)
   write (ou,*)  "# Reading in ", filename
+  write (ou,*)  "# Writing results to ", out_filename
   call read_csv_file(filename, table, columns)
   write (ou,*) '# length of input table ',size(table,1),'x',size(table,2)
+
+  CALL GET_COMMAND_ARGUMENT(3, value, length, status)
+  read(value,*) nexp
+  out_filename = filename(:len_trim(filename))//"_"//value(:len_trim(value))//".linked"
+
+  expnums = [(i,i=1,44,44/nexp)]
+  expnums = expnums(1:nexp)
+  ! only use detections from exposures 1, 22, 43
+  expnum0 = column(columns, 'expnum0')
+  expnum1 = column(columns, 'expnum1')
+
+  allocate(cond0(size(table,1)), cond1(size(table,1)))
+  cond0 = .false.
+  cond1 = .false.
+  do i=1,size(expnums)
+     cond0 = cond0.or.floor(table(:,expnum0)).eq.expnums(i)
+     cond1 = cond1.or.floor(table(:,expnum1)).eq.expnums(i)
+  end do
+  cond = cond0.and.cond1
+  object = pack([(i,i=1,size(table,1))],cond)
+  table = table(object,:)
+  write(ou,*) "# only consider 4 exposures ", size(table,1)
+
   call reshape_channels(table, columns, remap_table, remap_columns)
   table = remap_table
   columns = remap_columns
   write (ou,*) '# length of work table ',size(table,1),'x',size(table,2)
-    ! get the name of the file to work on from the commandline
+  ! get the name of the file to work on from the commandline
 
   CALL GET_COMMAND_ARGUMENT(2, value, length, status)
   if(status/=0)then
@@ -48,6 +74,8 @@ Program Main
   call read_csv_file(filename, plantlist, pl_columns)
   write (ou,*) '# length of input table ',size(plantlist,1),'x',size(plantlist,2)
 
+
+
   pl_id = column(pl_columns, 'id')
   pl_rate = column(pl_columns, 'rate')
   pl_angle = column(pl_columns, 'angle')
@@ -55,74 +83,55 @@ Program Main
   
   id = column(columns, 'kbo_id')
   mag = column(columns, 'pred_mag')
-  ra = column(columns, 'real_ra')
-  dec = column(columns, 'real_dec')
+  ra = column(columns, 'ra')
+  dec = column(columns, 'dec')
   jd = column(columns, 'time')
   expnum = column(columns, 'expnum')
+  likelihood = column(columns, 'p')
+  obj_num = column(columns, 'original_num')
+  obj_num_pp = column(columns, 'original_num_among_positively_predicted')
   
   write(ou,*) '# Coverting inputs to radians'
   table(:, ra) = table(:, ra)*drad
   table(:, dec) = table(:, dec)*drad
 
+  ! only accept objects with probabilty from detection model of 0.99 or higher
+  object = pack([(i,i=1,size(table,1))], table(:,likelihood).gt.0.99)
+  table = table(object,:)
+  write(ou,*) '# only keep p>0.99 sources ',size(table,1)
   
-  links = [(0, i=1,size(table,1))] ! will old value of object that source links to
-  idx = [(i, i=1,size(table,1))] ! a convenience vector of indice values
-
-  write(ou,*) '# merging observations of the same object on the same exposure'
-  ! link sources that are the same object, per chip (separation between two measures less than 3")
-  do j=1,size(table,1)
-     ! when links for index is non zero then this source is part of an object
-     if (links(j).ne.0) then
-        cycle
-     end if
-     ! in the input catalog we can detect the same source on a single chip many times
-     ! as the all expnum1-expnum2 combos are detected independently.
-     ! find all the sources that are other measurs of this source in this expousre
-     expnums = pack([idx],table(:,expnum).eq.table(j,expnum)) ! expnums is an index into all sources for this exposure
-     seps = separation(table(j,ra),table(j,dec), table(expnums,ra), table(expnums,dec)) 
-     cond = seps.lt.drad*3d0/3600d0.and.links(expnums).eq.0 ! considered close enough to be the same object
-     expnums = pack([expnums],cond) ! select from index those sources that meet the condition
-     if (size(expnums).lt.2) then
-        ! no need to 'merge' with other measures.
-        cycle
-     endif
-     ids = argsort(table(expnums,ra)) ! order the value to find the median.
-     med_ra = table(expnums(ids(size(ids)/2)), ra)
-     if (count(abs(table(expnums,ra)-med_ra).gt.5d0/3600d0/drad).gt.0) then ! scatter too large
-        write(ou,*) j,table(expnums,ra)-med_ra
-        stop
-     endif
-     table(expnums,ra) = med_ra
-     ids = argsort(table(expnums,dec))
-     med_dec = table(expnums(ids(size(ids)/2)), dec)
-     table(expnums,dec) = med_dec
-     links(expnums(2:)) = -1 ! a -ve here indicates that we can now ignore this source measure
-  end do
-
-  write(ou,*) "# Working with ",COUNT(links(:).eq.0)," source measurements"
-  write(ou,*) '# Will now do search through the input table to find linkable sources'
-  write(ou,'(A)') '# First Pass'
-  write (ou,'(9A8)') "KBO_ID","N_OBS","RATE","ANGLE","STDEV","NCOR","RRATE","RANGLE","RMAG"
-
-  idx = pack([idx],links.eq.0)
+  table = source_merge(table, ra, dec, expnum)
+  idx = [(i,i=1,size(table,1))]
+  links = 0*idx
+  rlink_length = 0d0*idx
+  
   do j=1,SIZE(idx)
      if (links(j).ne.0) then ! skip this source as it must linked to an object already
         cycle
      endif
      do rate_limit=1,10,2 ! search for possilbe sources that would be of this object
-        object = pack([idx], links(idx).eq.0.and.table(idx,expnum).ne.table(index(j),expnum))
+        object = pack([idx], links.eq.0)
+        if (size(object).lt.3) then
+           cycle
+        end if
         rates = rate(table(idx(j), ra), table(idx(j), dec), table(idx(j), jd), &
              &table(object, ra), table(object, dec), table(object, jd))
+
         
-        ! pick out sources that might link into an object
+        ! pick out sources that might link into an object require at least 1 hour arc
         rlow = (rate_limit * drad / 150d0)
-        rhigh = (rate_limit + 4) * drad / 150d0
+        rhigh = (rate_limit + 10) * drad / 150d0
         cond = rates.lt.rhigh.and.rates.gt.rlow
-        if (count(cond).le.3) then
+        ! and always include the 'root' source measure.
+        cond(findloc(object,j))=.true.
+        object = pack([object], cond)
+        expnums = table(object,expnum)
+        expnums = unique(expnums)
+        if (size(expnums).lt.3) then
            cycle
         endif
         ! look at sources within 'rate' of this source
-        object = pack([object], cond)
+
         !write(ou,*) size(object)
         !write(ou,'(I0,2F16.10,F16.8)') (object(i), table(object(i),ra), table(object(i),dec), table(object(i),jd), i=1,size(object))
         !stop
@@ -131,14 +140,16 @@ Program Main
 
         ! accept all object measurements that are within 1 arcseconds of the
         ! lsq ra/dec rate/angle fits
-        cond = (table(object, ra) - (ra0 + r * cos(angle) * (table(object, jd) - jd0)).lt.drad * (1. / 3600.0))
-        cond = (cond.and.(table(object, dec) - (dec0 + r * sin(angle) * (table(object, jd) - jd0)).lt.drad * (1. / 3600.0)))
 
-        if (count(cond).lt.3) then
-           cycle
-        endif
+        cond = (abs(table(object, ra) - (ra0 + r * cos(angle) * (table(object, jd) - jd0))).lt.match)
+        cond = (cond.and.(abs(table(object, dec) - (dec0 + r * sin(angle) * (table(object, jd) - jd0))).lt.match))
 
         object = pack([object], cond)
+        expnums = table(object,expnum)
+        expnums = unique(expnums)
+        if (size(expnums).lt.3) then
+           cycle
+        endif
 
         call skymotion_lsq(table(object, ra), table(object, dec), table(object, jd), &
              &r, angle, ra0, dec0, jd0, variance)
@@ -148,49 +159,80 @@ Program Main
            cycle
         end if
 
-        ! accept all object measurements that are within 1 arcseconds of the
-        ! lsq ra/dec rate/angle fits
-        cond = abs(table(object, ra) - (ra0 + r * cos(angle) * (table(object, jd) - jd0))).lt.drad * (1. / 3600.0)
-        cond = (cond.and.abs(table(object, dec) - (dec0 + r * sin(angle) * (table(object, jd) - jd0))).lt.drad * (1. / 3600.0))
+        ! accept all object measurements that are within 1 arcseconds of fit and aren't linked to an object
+        object = pack([idx],links.eq.0)
+        cond = abs(table(object, ra) - (ra0 + r * cos(angle) * (table(object, jd) - jd0))).lt.match
+        cond = cond.and.(abs(table(object, dec) - (dec0 + r * sin(angle) * (table(object, jd) - jd0))).lt.match)
         object = pack([object], cond)
-        if (count(cond).lt.3) then
+        
+        expnums = table(object,expnum)
+        expnums = unique(expnums)
+        if (size(expnums).lt.3) then
            cycle
         endif
 
-        links(object) = table(idx(j), j)
-        write (ou, '(I8,2(I8,F8.2,F8.2,F8.2))') &
-             &floor(table(object(1), id)), size(object), r * 150 / drad, angle / drad, sqrt(variance) * 3600d0 / drad, &
-             &size(expnums), 0d0, 0d0, 0d0
+        links(object) = object(1)
+        ids = table(object,id)
+        ids = unique(ids)
+        rlink_length(object(1)) = size(expnums)
+        !write (ou, '(I8,2(I8,F8.2,F8.2,F8.2))') &
+        !     &floor(table(object(1), id)), size(expnums), r * 150 / drad, angle / drad, sqrt(variance) * 3600d0 / drad, &
+        !     &size(object), 0d0, 0d0, 0d0
+        exit
      end do
   end do
-  stop
+  
+  
+  ids = pack([(i,i=1,size(links))],links.eq.0)
+  links(ids) = ids
+  ids = argsort(rlink_length)
+  cond = (rlink_length.gt.0)
   
   write(ou,'(A)') '# Second Pass'
-  write (ou,'(9A8)') "KBO_ID","N_OBS","RATE","ANGLE","STDEV","NCOR","RRATE","RANGLE","RMAG"
-  
-  idx = pack([(i,i=1,size(links))], links.gt.0)
-  do j=1,size(idx)
-     primary = pack([(k,k=1,size(links)],links.eq.table(idx(j),id))
-     call skymotion_lsq(table(object, ra), table(object, dec), table(object, jd), &
+  write(ou, *) '# lookig at ', count(cond), ' link groups'
+  write (ou,'(12A12)') "ID", "OBJNUM", "OBJNUMPP", "KBO_ID","N_OBS","RATE","ANGLE","STDEV","NCOR","RRATE","RANGLE","RMAG"
+
+  ! loop over all the linked objects, starting with the ones with the longest link_length
+  ! and check to seeif of ther sources are part of this object, starting with the shortest
+  ! link_length
+  do j=1,size(ids)
+     if (rlink_length(ids(j)).lt.3) then
+        cycle
+     endif
+     ! get the source id values for all the sources in object ids(j)
+     primary = pack([idx],links.eq.ids(j))
+     expnums = table(primary,expnum)
+     expnums = unique(expnums)
+     if (size(expnums).lt.3) then
+        links(primary) = 0
+        cycle
+     endif
+
+     call skymotion_lsq(table(primary, ra), table(primary, dec), table(primary, jd), &
           &r, angle, ra0, dec0, jd0, variance)
 
-     do i=size(idx),j+1,-1
-        secondary = pack([(k,k=1,size(links)],links.eq.table(idx(i),id))
-        cond = abs(table(secondary,ra) - (ra0 + r*cos(angle)*(table(secondary,jd)-jd0))).lt.drad*(1./3600.0)
-        cond = cond.and.abs(table(secondary,dec) - (dec0 + r*sin(angle)*(table(secondary,jd)-jd0))).lt.drad*(1./3600.0)
-        ! Assign objects that meet 'cond' to primary.
-        links(pack([secondary],cond),2)=ids(j)
+     do i=size(ids),j+1,-1
+        if (rlink_length(ids(i)).lt.1) then
+           cycle
+        endif
+        ! get the source id values for all the sources in object ids(i)
+        secondary = pack([idx],links.eq.ids(i))
+        cond = abs(table(secondary,ra) - (ra0 + r*cos(angle)*(table(secondary,jd)-jd0))).lt.match
+        cond = cond.and.(abs(table(secondary,dec) - (dec0 + r*sin(angle)*(table(secondary,jd)-jd0))).lt.match)
+        ! Assign sources that were part of object ids(i) to object ids(j) if cond is true
+        links(pack([secondary], cond))=ids(j)
+        rlink_length(ids(j)) = rlink_length(ids(j)) + COUNT(cond)
+        rlink_length(ids(i)) = rlink_length(ids(i)) - COUNT(cond)
      enddo
   enddo
-  
-  ids = pack([links(:,2)],links(:,2).gt.0)
-  if (size(ids).gt.1) then
-     ids = unique(ids)
-     ids = ids(:size(ids)-1)
-  endif
 
+  ! write newly linked object information to output file
+  open(newunit=unit,file=out_filename)
+
+  ids = argsort(rlink_length)
+  ! write (ou,'(A)') "# looking for link to artificial source and refining fit"
   do j=1,size(ids)
-     object = pack([links(:,1)],links(:,2).eq.ids(j))
+     object = pack([idx],links.eq.ids(j))
      if (size(object).lt.3) then
         cycle
      endif
@@ -200,24 +242,50 @@ Program Main
      else
          plant_res = [0d0, 0d0, 0d0]
      end if
+     expnums = table(object,expnum)
+     expnums = unique(expnums)
+     if (size(expnums).lt.3) then
+        links(object) = 0
+        cycle
+     endif
      call skymotion_lsq(table(object,ra), table(object,dec), table(object,jd),&
           &r, angle, ra0, dec0, jd0, variance)
-
-     expnums = floor(table(object,id))
-     if (size(expnums).gt.1) then
-        expnums = unique(expnums)
-        if (size(expnums).gt.1) then
-            expnums = expnums(:size(expnums) - 1)
+     if (variance*3600d0/drad.gt.5) then
+        cycle
+     endif
+     kboids = floor(table(object,id))
+     if (size(kboids).gt.1) then
+        kboids = unique(kboids)
+        if (size(kboids).gt.1) then
+            kboids = expnums(:size(kboids) - 1)
         end if
      endif
-     write (ou, '(I8,2(I8,F8.2,F8.2,F8.2))') &
-          &floor(table(object(1),id)), size(object), r*150/drad, angle/drad, sqrt(variance)*3600d0/drad,&
-          &SIZE(expnums),&
-             plant_res(1), plant_res(1), plant_res(3)
-
-      do i=1,size(object)
-          write(ou,*) '---> ',table(object(i),id), table(object(i), ra), table(object(i),dec), table(object(i),expnum)
-      end do
+     
+     expnums = pack([object],table(object,id).gt.0)
+     if (size(expnums).gt.0) then
+        kbo_id = floor(table(expnums(1),id))
+     else
+        kbo_id = -1
+     end if
+     expnums = table(object, expnum)
+     expnums = unique(expnums)
+     write(ou, '(4I10,2(I10,F12.2,F12.2,F12.2))') &
+          object(1), floor(table(object(1),obj_num)), floor(table(object(1),obj_num_pp)),&
+          kbo_id,&
+          size(expnums), r*150/drad, 180+angle/drad, sqrt(variance)*3600d0/drad,&
+          SIZE(kboids), plant_res(1), plant_res(1), plant_res(3)
+     expnums = argsort(table(object, expnum))
+     do i=1,size(expnums)
+        k=object(expnums(i))
+        write(unit, '(2F12.5,F16.8,I8,2F8.2,5I8)') &
+             table(k, ra)/drad, table(k, dec)/drad,&
+             table(k, jd), floor(table(k, expnum)), table(k, likelihood), &
+             table(k, mag), floor(table(k,id)), &
+             object(1), floor(table(k, obj_num)), floor(table(k, obj_num_pp)), floor(table(k, size(table,2)))
+     end do
+     !do i=1,size(object)
+     !    write(ou,*) '---> ',table(object(i),id), table(object(i), ra), table(object(i),dec), table(object(i),expnum)
+     !end do
   end do
-        
+  close(unit)
 end program main

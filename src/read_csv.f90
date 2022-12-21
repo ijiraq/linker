@@ -94,9 +94,11 @@ contains
     enddo
     ! make the out array twice as long as in but remove the columns that match '1'
 
-    allocate(out(size(in,1)*2, size(columns)-remap_count))
-    allocate(character(len=len(columns(1))) :: out_columns(size(columns)-remap_count))
-
+    allocate(out(size(in,1)*2, size(columns)-remap_count+1))
+    allocate(character(len=len(columns(1))) :: out_columns(size(columns)-remap_count+1))
+    out_columns(size(out_columns,1)) = "channel"
+    out(:size(in,1),size(out,2)) = 0
+    out(size(in,1)+1:,size(out,2)) = 1
     out_col_idx=0
     do in_col_idx=1,size(columns)
        if (INDEX(columns(in_col_idx),'0').gt.0.or.INDEX(columns(in_col_idx),'1').eq.0) then
